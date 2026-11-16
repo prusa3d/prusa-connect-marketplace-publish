@@ -1,0 +1,12 @@
+name: fixture
+kind: sink
+version: 0.0.1
+license: MIT
+contract_major: 1
+platforms:
+  - linux_amd64
+  - linux_arm64
+  - windows_amd64
+ui:
+  entry: ui/index.js
+  library: ">=0.0.1 <1.0.0"

@@ -1,0 +1,402 @@
+name: Publish a Prusa Connect extension (verified build)
+
+# The builder. An extension's own workflow calls it; it builds the extension
+# from the commit the run is for, and publishes the build with that commit's
+# source to the Prusa Plugin Marketplace.
+#
+#   jobs:
+#     publish:
+#       uses: prusa3d/prusa-connect-marketplace-publish/.github/workflows/publish.yml@v1
+#       with:
+#         path: .
+#       secrets: inherit
+#       permissions:
+#         contents: read
+#         id-token: write
+#         attestations: write
+#
+# Why a reusable workflow and not an action: a caller cannot add steps to the
+# jobs below, so what runs in them is this file alone. The OIDC token the
+# publish job requests names this file in `job_workflow_ref`, signed by
+# GitHub, and the marketplace accepts a verified build only with it. The
+# author's workflow therefore cannot hand the marketplace a binary these jobs
+# did not build, or a source they did not build it from.
+#
+# Three jobs, so the author's code never shares a runner with the binary, the
+# signing key or the token:
+#
+#   program  builds the Go program for every platform module.yaml declares.
+#            Runs none of the author's code: no Makefile, no go generate, no
+#            cgo, no toolchain download. Its outputs are the binaries' SHA-256.
+#   bundle   builds the browser bundle. This runs the author's code (package
+#            scripts, the Vite configuration), so it gets no secret and no
+#            token, and only its ui/ is used.
+#   publish  checks the binaries against program's outputs, takes module.yaml
+#            and the rest from the commit itself, makes the source archive,
+#            signs, and uploads with the OIDC token.
+#
+# Every input reaches a script through env, never through ${{ }} inside it.
+
+on:
+  workflow_call:
+    inputs:
+      path:
+        description: The extension's folder in the repository (module.yaml, go.mod, ui/). Several extensions in one repository each have their own.
+        type: string
+        default: .
+      module:
+        description: The extension's module path (github.com/acme/spools). Empty reads it from go.mod in path, or uses github.com/<this repository> for an extension with no process.
+        type: string
+        default: ''
+      bundle-command:
+        description: The command that builds the browser bundle, run in path. It must leave the release layout in bundle-output (module.yaml at its root, the bundle under ui/).
+        type: string
+        default: cd ui && pnpm install --frozen-lockfile && pnpm run build
+      bundle-output:
+        description: Where bundle-command leaves the release layout, relative to path.
+        type: string
+        default: ui/dist
+      core-ref:
+        description: Until the Prusa Connect SDK and the @prusa packages are published, an extension builds against a checkout of Prusa Connect in .core/ (go.mod replaces the sdk with it). Name the branch or tag, and the builder checks prusa3d/prusa-connect out there itself. Empty checks nothing out.
+        type: string
+        default: ''
+      node-version:
+        description: The Node.js the bundle builds with.
+        type: string
+        default: '22'
+      environment:
+        description: The GitHub environment the publish job runs in. It holds the signing key; give it required reviewers. The marketplace's trusted publisher names it too.
+        type: string
+        default: release
+      channel:
+        description: Release channel, stable or beta. Empty picks beta for a GitHub pre-release, stable otherwise.
+        type: string
+        default: ''
+      changelog:
+        description: Release notes (Markdown). Empty uses the GitHub release body.
+        type: string
+        default: ''
+      marketplace-url:
+        description: The marketplace to publish to.
+        type: string
+        default: https://plugin-marketplace.prusa3d.com
+      check-version:
+        description: When the run is for a tag, require the tag to end with module.yaml's version (v1.2.0, spools/v1.2.0).
+        type: boolean
+        default: true
+      allow-existing:
+        description: Treat a version the marketplace already has as success (for re-runs).
+        type: boolean
+        default: false
+      dry-run:
+        description: Build, check and sign, but do not upload.
+        type: boolean
+        default: false
+    secrets:
+      PRUSA_CONNECT_DEPLOY_KEY:
+        description: A read-only deploy key of prusa3d/prusa-connect, for core-ref while that repository is private.
+        required: false
+      PRUSA_CONNECT_EXTENSION_SIGNING_KEY:
+        description: "The author's RSA private key (PEM), from the environment's secrets with `secrets: inherit`, or named."
+        required: false
+    outputs:
+      extension-id:
+        description: The extension id derived from the module path.
+        value: ${{ jobs.publish.outputs.extension-id }}
+      version:
+        description: The version from module.yaml.
+        value: ${{ jobs.publish.outputs.version }}
+      sha256:
+        description: SHA-256 of the published archive.
+        value: ${{ jobs.publish.outputs.sha256 }}
+      status:
+        description: in_review, exists or dry-run.
+        value: ${{ jobs.publish.outputs.status }}
+      url:
+        description: The extension in the author console, where the release waits for review.
+        value: ${{ jobs.publish.outputs.url }}
+
+permissions: {}
+
+jobs:
+  program:
+    name: Build the program
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      name: ${{ steps.manifest.outputs.name }}
+      platforms: ${{ steps.manifest.outputs.platforms }}
+      has-ui: ${{ steps.manifest.outputs.has-ui }}
+      digests: ${{ steps.build.outputs.digests }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          path: src
+          persist-credentials: false
+
+      # The builder's own step: Prusa Connect at core-ref into .core/, where the
+      # extension's go.mod and bundle build look for it.
+      - name: Check out Prusa Connect
+        if: inputs.core-ref != ''
+        env:
+          EXT: ${{ inputs.path }}
+          REF: ${{ inputs.core-ref }}
+          DEPLOY_KEY: ${{ secrets.PRUSA_CONNECT_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          dest="$GITHUB_WORKSPACE/src/$EXT/.core"
+          if [ -n "$DEPLOY_KEY" ]; then
+            install -m 600 /dev/null "$RUNNER_TEMP/core_key"
+            printf '%s\n' "$DEPLOY_KEY" >"$RUNNER_TEMP/core_key"
+            GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/core_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+              git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$REF" git@github.com:prusa3d/prusa-connect.git "$dest"
+            rm -f "$RUNNER_TEMP/core_key"
+          else
+            git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$REF" https://github.com/prusa3d/prusa-connect.git "$dest"
+          fi
+          echo "Prusa Connect at $(git -C "$dest" rev-parse HEAD)"
+
+      - name: Read module.yaml
+        id: manifest
+        env:
+          EXT: ${{ inputs.path }}
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE/src"
+          dir="$(cd "$root/$EXT" 2>/dev/null && pwd -P)" || { echo "::error::path '$EXT' is not a folder of the repository"; exit 1; }
+          case "$dir/" in "$(cd "$root" && pwd -P)/"*) ;; *) echo "::error::path '$EXT' leaves the repository"; exit 1 ;; esac
+          [ -f "$dir/module.yaml" ] || { echo "::error::$EXT has no module.yaml"; exit 1; }
+          name="$(sed -n 's/^name:[[:space:]]*//p' "$dir/module.yaml" | head -1 | tr -d '"'"'"'')"
+          printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$' || { echo "::error::module.yaml name '$name' is not lowercase letters, digits and hyphens"; exit 1; }
+          platforms="$(awk '
+            /^platforms:/ { inside = 1; next }
+            inside && /^[^ \t#]/ { inside = 0 }
+            inside && /^[ \t]*-[ \t]/ { sub(/^[ \t]*-[ \t]*/, ""); sub(/[ \t]*(#.*)?$/, ""); print }
+          ' "$dir/module.yaml" | tr '\n' ' ')"
+          for platform in $platforms; do
+            printf '%s' "$platform" | grep -Eq '^[a-z0-9]+_[a-z0-9]+$' || { echo "::error::platform '$platform' is not GOOS_GOARCH"; exit 1; }
+          done
+          has_ui=false
+          grep -q '^ui:' "$dir/module.yaml" && has_ui=true
+          { echo "dir=$dir"; echo "name=$name"; echo "platforms=$platforms"; echo "has-ui=$has_ui"; } >>"$GITHUB_OUTPUT"
+
+      - if: steps.manifest.outputs.platforms != ''
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: src/${{ inputs.path }}/go.mod
+          cache: false
+
+      # The program alone, from the commit: no Makefile, no go generate, no
+      # cgo, and the toolchain setup-go installed (a go.mod cannot fetch
+      # another). Modules come through the Go proxy, checked against go.sum.
+      # -buildvcs stamps the commit into every binary, so the marketplace
+      # reads off the binary itself which commit it was built from; the core
+      # checked out into .core/ is kept out of git's view so it does not mark
+      # the tree as modified.
+      - name: Build every platform
+        id: build
+        env:
+          DIR: ${{ steps.manifest.outputs.dir }}
+          NAME: ${{ steps.manifest.outputs.name }}
+          PLATFORMS: ${{ steps.manifest.outputs.platforms }}
+          GOTOOLCHAIN: local
+          CGO_ENABLED: '0'
+          GOFLAGS: -mod=readonly
+        run: |
+          set -euo pipefail
+          echo '.core/' >>"$GITHUB_WORKSPACE/src/.git/info/exclude"
+          out="$GITHUB_WORKSPACE/program"
+          mkdir -p "$out"
+          for platform in $PLATFORMS; do
+            goos="${platform%%_*}" goarch="${platform#*_}"
+            binary="${NAME}_${platform}"
+            [ "$goos" = windows ] && binary="$binary.exe"
+            echo "building $binary"
+            (cd "$DIR" && GOOS="$goos" GOARCH="$goarch" go build -trimpath -buildvcs=true -ldflags='-s -w' -o "$out/$binary" .)
+          done
+          {
+            echo 'digests<<DIGESTS_END'
+            (cd "$out" && find . -type f | sed 's|^\./||' | sort | xargs -r sha256sum)
+            echo 'DIGESTS_END'
+          } >>"$GITHUB_OUTPUT"
+          touch "$out/.keep"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: program
+          path: program/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
+  bundle:
+    name: Build the browser bundle
+    needs: program
+    if: needs.program.outputs.has-ui == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The author's code runs here: no secret, no token, read access only.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          path: src
+          persist-credentials: false
+      # The builder's own step: Prusa Connect at core-ref into .core/, where the
+      # extension's go.mod and bundle build look for it.
+      - name: Check out Prusa Connect
+        if: inputs.core-ref != ''
+        env:
+          EXT: ${{ inputs.path }}
+          REF: ${{ inputs.core-ref }}
+          DEPLOY_KEY: ${{ secrets.PRUSA_CONNECT_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          dest="$GITHUB_WORKSPACE/src/$EXT/.core"
+          if [ -n "$DEPLOY_KEY" ]; then
+            install -m 600 /dev/null "$RUNNER_TEMP/core_key"
+            printf '%s\n' "$DEPLOY_KEY" >"$RUNNER_TEMP/core_key"
+            GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/core_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+              git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$REF" git@github.com:prusa3d/prusa-connect.git "$dest"
+            rm -f "$RUNNER_TEMP/core_key"
+          else
+            git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$REF" https://github.com/prusa3d/prusa-connect.git "$dest"
+          fi
+          echo "Prusa Connect at $(git -C "$dest" rev-parse HEAD)"
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+      # hashFiles() walks the whole workspace, which a checked-out core (.core/)
+      # can make it fail on; a plain test does not.
+      - name: Look for go.mod
+        id: gomod
+        env:
+          EXT: ${{ inputs.path }}
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/src/$EXT/go.mod" ]; then echo "found=true" >>"$GITHUB_OUTPUT"; fi
+      - if: steps.gomod.outputs.found == 'true'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: src/${{ inputs.path }}/go.mod
+          cache: false
+      - run: corepack enable
+      - name: Build the bundle
+        env:
+          EXT: ${{ inputs.path }}
+          COMMAND: ${{ inputs.bundle-command }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/src/$EXT"
+          bash -c "$COMMAND"
+      - name: Keep ui/ alone
+        env:
+          EXT: ${{ inputs.path }}
+          OUTPUT: ${{ inputs.bundle-output }}
+        run: |
+          set -euo pipefail
+          from="$GITHUB_WORKSPACE/src/$EXT/$OUTPUT/ui"
+          [ -d "$from" ] || { echo "::error::the bundle build left no ui/ in $EXT/$OUTPUT"; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/bundle"
+          cp -R "$from" "$GITHUB_WORKSPACE/bundle/ui"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bundle
+          path: bundle/
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Sign and publish
+    needs: [program, bundle]
+    if: ${{ !cancelled() && needs.program.result == 'success' && (needs.bundle.result == 'success' || needs.bundle.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # A dry run waits for no reviewer: it signs with a throwaway key and uploads nothing.
+    environment: ${{ !inputs.dry-run && inputs.environment || '' }}
+    permissions:
+      contents: read
+      id-token: write # proves this run, this file and the commit to the marketplace
+      attestations: write # build provenance for the archive and every binary
+    outputs:
+      extension-id: ${{ steps.publish.outputs.extension-id }}
+      version: ${{ steps.publish.outputs.version }}
+      sha256: ${{ steps.publish.outputs.sha256 }}
+      status: ${{ steps.publish.outputs.status }}
+      url: ${{ steps.publish.outputs.url }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          path: src
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: program
+          path: program
+      - if: needs.bundle.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle
+          path: bundle
+
+      # The binaries are the ones program built: its outputs were written by
+      # its own steps, which no other job can change. module.yaml and the
+      # documents come from the commit, never from the bundle build.
+      - name: Assemble the release
+        env:
+          EXT: ${{ inputs.path }}
+          DIGESTS: ${{ needs.program.outputs.digests }}
+        run: |
+          set -euo pipefail
+          rm -f program/.keep
+          (cd program && find . -type f | sed 's|^\./||' | sort | xargs -r sha256sum) >got.txt
+          printf '%s\n' "$DIGESTS" | sed '/^$/d' >want.txt
+          diff -u want.txt got.txt || { echo "::error::the binaries are not the ones the program job built"; exit 1; }
+          root="$GITHUB_WORKSPACE/src"
+          dir="$root/$EXT"
+          mkdir release
+          cp "$dir/module.yaml" release/
+          if [ -n "$(ls -A program)" ]; then cp program/* release/ && chmod 0755 release/*_*; fi
+          [ -d bundle/ui ] && cp -R bundle/ui release/ui
+          for doc in README.md CHANGELOG.md; do [ -f "$dir/$doc" ] && cp "$dir/$doc" release/; done
+          if [ -f "$dir/LICENSE" ]; then cp "$dir/LICENSE" release/; elif [ -f "$root/LICENSE" ]; then cp "$root/LICENSE" release/; fi
+          git -C "$root" archive --format=tar.gz -o "$GITHUB_WORKSPACE/source.tar.gz" HEAD
+          echo "Source: $(wc -c <"$GITHUB_WORKSPACE/source.tar.gz") bytes of $(git -C "$root" rev-parse HEAD)"
+
+      # A dry run with no signing key signs with a throwaway one.
+      - name: Throwaway key for a dry run
+        if: inputs.dry-run
+        env:
+          KEY: ${{ secrets.PRUSA_CONNECT_EXTENSION_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEY" ]; then
+            echo "Dry run with no signing key: signing with a throwaway one."
+            key="$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 2>/dev/null)"
+            { echo 'DRY_RUN_KEY<<KEY_END'; echo "$key"; echo 'KEY_END'; } >>"$GITHUB_ENV"
+          fi
+
+      # The checks, the signature, the upload and the provenance attestation
+      # are this repository's action, at the tag the builder itself runs from.
+      # A reusable workflow cannot name its own repository relatively, and a
+      # caller resolves this one even while the repository is private.
+      - name: Sign and upload
+        id: publish
+        uses: prusa3d/prusa-connect-marketplace-publish@v1
+        with:
+          path: release
+          source: source.tar.gz
+          module: ${{ inputs.module }}
+          module-dir: src/${{ inputs.path }}
+          private-key: ${{ secrets.PRUSA_CONNECT_EXTENSION_SIGNING_KEY || env.DRY_RUN_KEY }}
+          marketplace-url: ${{ inputs.marketplace-url }}
+          channel: ${{ inputs.channel }}
+          changelog: ${{ inputs.changelog }}
+          check-version: ${{ inputs.check-version }}
+          allow-existing: ${{ inputs.allow-existing }}
+          dry-run: ${{ inputs.dry-run }}

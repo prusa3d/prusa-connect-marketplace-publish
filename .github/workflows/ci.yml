@@ -1,0 +1,70 @@
+name: CI
+
+# shellcheck over the scripts, then the self-test: it builds a sample release,
+# runs publish.sh on it as a dry run, verifies the signature and the checksums,
+# and feeds it the releases the marketplace refuses. Then the builder itself
+# (publish.yml) builds tests/fixture as a dry run.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: shellcheck publish.sh tests/selftest.sh
+      - name: Self-test
+        run: bash tests/selftest.sh
+
+  # The composite action itself (@v1), as a workflow loads it: a broken
+  # action.yml fails here, not in every caller's run.
+  action:
+    name: Action (dry run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Sample release and key
+        run: |
+          mkdir -p sample/ui
+          printf 'name: sample\nversion: 1.0.0\nlicense: MIT\nui:\n  entry: ui/index.js\n' >sample/module.yaml
+          echo 'export default {}' >sample/ui/index.js
+          openssl genpkey -algorithm RSA -out "$RUNNER_TEMP/key.pem" -pkeyopt rsa_keygen_bits:2048 2>/dev/null
+          { echo 'KEY<<EOF'; cat "$RUNNER_TEMP/key.pem"; echo 'EOF'; } >>"$GITHUB_ENV"
+      - id: publish
+        uses: ./
+        with:
+          path: sample
+          module: github.com/example/sample
+          private-key: ${{ env.KEY }}
+          dry-run: 'true'
+      - env:
+          ARCHIVE: ${{ steps.publish.outputs.archive }}
+        run: tar -tvzf "$ARCHIVE"
+
+  verified-build:
+    name: Verified build (dry run)
+    # A pull request from a fork gets no OIDC token.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/publish.yml
+    with:
+      path: tests/fixture
+      bundle-command: node ui/build.mjs
+      check-version: false
+      dry-run: true
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write

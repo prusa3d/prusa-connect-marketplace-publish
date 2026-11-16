@@ -1,0 +1,112 @@
+name: Publish a Prusa Connect extension
+description: Check, sign and publish a Prusa Connect extension release to the Prusa Plugin Marketplace with trusted publishing.
+author: Prusa Research
+branding:
+  icon: upload-cloud
+  color: orange
+
+inputs:
+  path:
+    description: The release directory your build wrote (module.yaml, one <name>_<goos>_<goarch> binary per platform, ui/ for the browser bundle). Relative to the workspace.
+    default: release
+  module:
+    description: The extension's module path, its identity in Prusa Connect and the marketplace (github.com/acme/spools becomes com.github.aux.acme.spools). Empty uses github.com/<this repository>, lowercase.
+    default: ''
+  private-key:
+    description: The author's RSA private key (PEM) that signs checksums.txt. Pass a secret, e.g. secrets.PRUSA_CONNECT_EXTENSION_SIGNING_KEY. Its public half must be an active signing key in the author console (RSA, 2048 bits or more).
+    required: true
+  marketplace-url:
+    description: The marketplace to publish to.
+    default: https://plugin-marketplace.prusa3d.com
+  channel:
+    description: Release channel, stable or beta. Empty picks beta for a GitHub pre-release, stable otherwise.
+    default: ''
+  changelog:
+    description: Release notes (Markdown). Empty uses the GitHub release body.
+    default: ''
+  check-version:
+    description: When the run is for a tag, require the tag to end with module.yaml's version (v1.2.0, spools/v1.2.0).
+    default: 'true'
+  attest:
+    description: 'Record a GitHub build provenance attestation for the archive and every binary, so anyone can check which repository, commit and workflow produced them (gh attestation verify). Needs `attestations: write`; on a private repository it needs a plan that offers artifact attestations.'
+    default: 'true'
+  allow-existing:
+    description: Treat a version the marketplace already has as success instead of a failure (for re-runs).
+    default: 'false'
+  source:
+    description: The source archive (git archive --format=tar.gz) of the commit the release was built from. Set by the builder (.github/workflows/publish.yml), which uploads it with the release as a verified build; leave it empty otherwise.
+    default: ''
+  module-dir:
+    description: The extension's folder, to read the module path from its go.mod when the module input is empty. Set by the builder.
+    default: ''
+  dry-run:
+    description: Check, sign and pack the release, but do not upload it.
+    default: 'false'
+
+outputs:
+  extension-id:
+    description: The extension id derived from the module path.
+    value: ${{ steps.pack.outputs.extension-id }}
+  version:
+    description: The version from module.yaml.
+    value: ${{ steps.pack.outputs.version }}
+  archive:
+    description: Path of the signed .tar.gz that was built.
+    value: ${{ steps.pack.outputs.archive }}
+  sha256:
+    description: SHA-256 of the archive; Prusa Connect refuses a download with any other.
+    value: ${{ steps.pack.outputs.sha256 }}
+  status:
+    description: in_review, exists or dry-run.
+    value: ${{ steps.upload.outputs.status || steps.pack.outputs.status }}
+  subjects:
+    description: A sha256sum-format file naming the archive and every file in it (the attestation subjects).
+    value: ${{ steps.pack.outputs.subjects }}
+  url:
+    description: The extension in the author console, where the release waits for review.
+    value: ${{ steps.upload.outputs.url || steps.pack.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    # Check, sign and pack. With an attestation to record, stop there: the
+    # attestation comes first, and the upload only after it succeeded, so a
+    # release never reaches the marketplace without its provenance.
+    - id: pack
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/publish.sh"'
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_MODULE: ${{ inputs.module }}
+        INPUT_PRIVATE_KEY: ${{ inputs.private-key }}
+        INPUT_MARKETPLACE_URL: ${{ inputs.marketplace-url }}
+        INPUT_CHANNEL: ${{ inputs.channel }}
+        INPUT_CHANGELOG: ${{ inputs.changelog }}
+        INPUT_CHECK_VERSION: ${{ inputs.check-version }}
+        INPUT_ALLOW_EXISTING: ${{ inputs.allow-existing }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+        INPUT_SOURCE: ${{ inputs.source }}
+        INPUT_MODULE_DIR: ${{ inputs.module-dir }}
+        INPUT_PHASE: ${{ (inputs.attest == 'true' && inputs.dry-run != 'true') && 'pack' || 'all' }}
+    - id: attest
+      if: inputs.attest == 'true' && inputs.dry-run != 'true'
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      with:
+        subject-checksums: ${{ steps.pack.outputs.subjects }}
+    - id: upload
+      if: inputs.attest == 'true' && inputs.dry-run != 'true'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/publish.sh"'
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_MODULE: ${{ inputs.module }}
+        INPUT_PRIVATE_KEY: ${{ inputs.private-key }}
+        INPUT_MARKETPLACE_URL: ${{ inputs.marketplace-url }}
+        INPUT_CHANNEL: ${{ inputs.channel }}
+        INPUT_CHANGELOG: ${{ inputs.changelog }}
+        INPUT_CHECK_VERSION: ${{ inputs.check-version }}
+        INPUT_ALLOW_EXISTING: ${{ inputs.allow-existing }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+        INPUT_SOURCE: ${{ inputs.source }}
+        INPUT_MODULE_DIR: ${{ inputs.module-dir }}
+        INPUT_PHASE: upload
