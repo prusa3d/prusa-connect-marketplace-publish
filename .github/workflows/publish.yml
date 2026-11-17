@@ -383,11 +383,12 @@ jobs:
 
       # The checks, the signature, the upload and the provenance attestation
       # are this repository's action, at the tag the builder itself runs from.
-      # A reusable workflow cannot name its own repository relatively, and a
-      # caller resolves this one even while the repository is private.
+      # A reusable workflow cannot name its own repository relatively. The
+      # action is pinned by commit, as every other step here, so a caller whose
+      # repository requires actions pinned to a full commit SHA can run it.
       - name: Sign and upload
         id: publish
-        uses: prusa3d/prusa-connect-marketplace-publish@v1
+        uses: prusa3d/prusa-connect-marketplace-publish@e49e26ddb37552d66cadd996d9111d3df82b0024 # v1.0.0
         with:
           path: release
           source: source.tar.gz
