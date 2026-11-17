@@ -41,7 +41,7 @@ marketplace="${marketplace%/}"
 origin="$(printf '%s\n' "$marketplace" | sed -n 's|^\(https\{0,1\}://[^/]*\).*|\1|p')"
 [ -n "$origin" ] || fail "marketplace-url '$marketplace' is not an http(s) address"
 [ -d "$src" ] || fail "no release directory '$src' (set the path input to the directory your build wrote)"
-[ -n "${INPUT_PRIVATE_KEY:-}" ] || fail "private-key is empty: pass the signing key secret, e.g. private-key: \${{ secrets.PRUSA_CONNECT_EXTENSION_SIGNING_KEY }}"
+[ -n "${INPUT_PRIVATE_KEY:-}" ] || fail "private-key is empty: the signing key secret did not reach this step. Pass it as private-key: \${{ secrets.PRUSA_CONNECT_EXTENSION_SIGNING_KEY }} (with the builder: under secrets: by name; secrets: inherit does not cross organisations)"
 
 # The extension's identity. By default the module path in the extension's
 # go.mod (the builder passes its folder), else the repository's own address,

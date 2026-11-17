@@ -9,7 +9,8 @@ name: Publish a Prusa Connect extension (verified build)
 #       uses: prusa3d/prusa-connect-marketplace-publish/.github/workflows/publish.yml@v1
 #       with:
 #         path: .
-#       secrets: inherit
+#       secrets:
+#         PRUSA_CONNECT_EXTENSION_SIGNING_KEY: ${{ secrets.PRUSA_CONNECT_EXTENSION_SIGNING_KEY }}
 #       permissions:
 #         contents: read
 #         id-token: write
@@ -97,7 +98,7 @@ on:
         description: A read-only deploy key of prusa3d/prusa-connect, for core-ref while that repository is private.
         required: false
       PRUSA_CONNECT_EXTENSION_SIGNING_KEY:
-        description: "The author's RSA private key (PEM), from the environment's secrets with `secrets: inherit`, or named."
+        description: "The author's RSA private key (PEM). Pass it by name; `secrets: inherit` reaches no workflow outside the caller's organisation, so it never reaches this one. A secret of the `release` environment is read here too, as this job runs in it."
         required: false
     outputs:
       extension-id:
@@ -329,6 +330,18 @@ jobs:
       status: ${{ steps.publish.outputs.status }}
       url: ${{ steps.publish.outputs.url }}
     steps:
+      # Fail first, and say where the key belongs: an empty key would otherwise
+      # surface only at the upload, after the attestation.
+      - name: Check the signing key
+        if: ${{ !inputs.dry-run }}
+        env:
+          KEY: ${{ secrets.PRUSA_CONNECT_EXTENSION_SIGNING_KEY }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error title=No signing key::PRUSA_CONNECT_EXTENSION_SIGNING_KEY is empty. Store it in the repository (gh secret set PRUSA_CONNECT_EXTENSION_SIGNING_KEY --env $ENVIRONMENT < private_key.pem) and pass it by name in your workflow: secrets: PRUSA_CONNECT_EXTENSION_SIGNING_KEY: \$""{{ secrets.PRUSA_CONNECT_EXTENSION_SIGNING_KEY }}. secrets: inherit does not reach a workflow in another organisation."
+            exit 1
+          fi
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           path: src

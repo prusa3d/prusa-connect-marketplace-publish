@@ -35,7 +35,9 @@ jobs:
       path: .                       # the extension's folder: module.yaml, go.mod, ui/
       bundle-command: make ui-build # what builds ui/dist (default: pnpm build in ui/)
       core-ref: main                # Prusa Connect into .core/, until the SDK is published
-    secrets: inherit                # PRUSA_CONNECT_EXTENSION_SIGNING_KEY from the environment
+    # By name: `secrets: inherit` does not reach a workflow in another organisation.
+    secrets:
+      PRUSA_CONNECT_EXTENSION_SIGNING_KEY: ${{ secrets.PRUSA_CONNECT_EXTENSION_SIGNING_KEY }}
     permissions:
       contents: read
       id-token: write
